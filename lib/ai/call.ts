@@ -9,6 +9,7 @@ import {
   type ModelId,
 } from "@/lib/ai/models";
 import { costUsd } from "@/lib/ai/pricing";
+import { countingFetch, type FetchStats } from "@/lib/ai/retry-fetch";
 import {
   errorMessage,
   traceCall,
@@ -66,8 +67,13 @@ export type AiCallRow = {
   cost_usd: number | null;
   latency_ms: number;
   ok: boolean;
-  /** Model requests the call made: one per step (tool calls plus the reply). */
+  /**
+   * HTTP requests the call sent: one per step (tool calls plus the reply),
+   * plus any retried after a 5xx.
+   */
   requests: number;
+  /** Time lost to failed requests and the waits before retrying them. */
+  lost_ms?: number;
   /**
    * Google's reason each step stopped, like "STOP". Null means the stream
    * ended with no reason at all: Google cut it off.
@@ -78,19 +84,25 @@ export type AiCallRow = {
   created_at: string;
 };
 
-function google() {
+/** A fresh count of one call's HTTP requests (lib/ai/retry-fetch.ts). */
+const newStats = (): FetchStats => ({ attempts: 0, lostMs: 0 });
+
+function google(stats: FetchStats) {
   const googleKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY?.trim();
   if (!googleKey) throw new AiNotConfiguredError();
-  return createGoogleGenerativeAI({ apiKey: googleKey });
+  return createGoogleGenerativeAI({
+    apiKey: googleKey,
+    fetch: countingFetch(stats),
+  });
 }
 
-function languageModel(model: ModelId) {
+function languageModel(model: ModelId, stats: FetchStats) {
   const entry = MODELS.find((m) => m.id === model);
   const id =
     entry && "googleId" in entry
       ? entry.googleId
       : model.slice("google/".length);
-  return google()(id);
+  return google(stats)(id);
 }
 
 const watchers = new Set<(row: AiCallRow) => void>();
@@ -137,13 +149,17 @@ function maxRetries(): number | undefined {
 type Usage = { inputTokens?: number; outputTokens?: number };
 
 /** Builds the ai_calls row for a call that started at `started`. */
-function rowFor(info: CallInfo, model: ModelId, started: number) {
+function rowFor(
+  info: CallInfo,
+  model: ModelId,
+  started: number,
+  stats: FetchStats,
+) {
   return (
     ok: boolean,
     usage?: Usage,
-    requests = 1,
-    error?: unknown,
     steps?: { rawFinishReason?: string }[],
+    error?: unknown,
   ): AiCallRow => {
     const input = usage?.inputTokens ?? null;
     const output = usage?.outputTokens ?? null;
@@ -159,7 +175,9 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
           : null,
       latency_ms: Math.round(performance.now() - started),
       ok,
-      requests,
+      // A mocked model sends no HTTP requests, so count its steps instead.
+      requests: stats.attempts || steps?.length || 1,
+      ...(stats.lostMs > 0 && { lost_ms: Math.round(stats.lostMs) }),
       ...(steps && {
         finish_reasons: steps.map((s) => s.rawFinishReason ?? null),
       }),
@@ -186,9 +204,13 @@ function traceFor(
 }
 
 /** What every call adds to the AI SDK options: model, retries, tracing. */
-function settings(model: ModelId, span: CallSpan, tools: ToolSet | undefined) {
+function settings(
+  model: ReturnType<typeof languageModel>,
+  span: CallSpan,
+  tools: ToolSet | undefined,
+) {
   return {
-    model: languageModel(model),
+    model,
     maxRetries: maxRetries(),
     tools: span.tools(tools),
     telemetry: span.telemetry,
@@ -207,21 +229,20 @@ async function tracked<
   run: (call: ReturnType<typeof settings>) => Promise<T>,
 ): Promise<T> {
   const model = info.model ?? defaultModel();
-  const row = rowFor(info, model, performance.now());
+  const stats = newStats();
+  const row = rowFor(info, model, performance.now(), stats);
   // Checks the key before anything is traced.
-  languageModel(model);
+  const languageModelFor = languageModel(model, stats);
   const span = traceFor(info, model, options);
   try {
-    const result = await run(settings(model, span, options.tools));
+    const result = await run(settings(languageModelFor, span, options.tools));
     span.end(result.text);
-    await logCall(
-      row(true, result.usage, result.steps.length, undefined, result.steps),
-    );
+    await logCall(row(true, result.usage, result.steps));
     return result;
   } catch (error) {
     span.fail(error);
     if (!(error instanceof AiNotConfiguredError))
-      await logCall(row(false, undefined, 1, error));
+      await logCall(row(false, undefined, undefined, error));
     throw error;
   }
 }
@@ -260,6 +281,7 @@ export async function callEmbedMany(
   values: string[],
 ) {
   const started = performance.now();
+  const stats = newStats();
   // Google doesn't report tokens for embeddings, so tokens and cost are null.
   const log = (ok: boolean, error?: unknown) =>
     logCall({
@@ -271,11 +293,14 @@ export async function callEmbedMany(
       cost_usd: null,
       latency_ms: Math.round(performance.now() - started),
       ok,
-      requests: 1,
+      requests: stats.attempts || 1,
+      ...(stats.lostMs > 0 && { lost_ms: Math.round(stats.lostMs) }),
       ...(error !== undefined && { error: describeError(error) }),
       created_at: new Date().toISOString(),
     });
-  const embedder = google().embedding(EMBEDDING_MODEL.slice("google/".length));
+  const embedder = google(stats).embedding(
+    EMBEDDING_MODEL.slice("google/".length),
+  );
   const span = traceEmbedding({
     name: info.feature,
     model: EMBEDDING_MODEL,
@@ -313,23 +338,24 @@ type StreamOptions = DistributiveOmit<
  */
 export function callStream(info: CallInfo, options: StreamOptions) {
   const model = info.model ?? defaultModel();
-  const row = rowFor(info, model, performance.now());
-  languageModel(model);
+  const stats = newStats();
+  const row = rowFor(info, model, performance.now(), stats);
+  const languageModelFor = languageModel(model, stats);
   const span = traceFor(info, model, options);
   return streamText({
     ...options,
-    ...settings(model, span, options.tools),
+    ...settings(languageModelFor, span, options.tools),
     onFinish: ({ totalUsage, steps, text }) => {
       // Google's own reason each step stopped (STOP, MAX_TOKENS, ...), which
       // the AI SDK folds into "other" when it has no name for it.
       span.end(text, {
         finishReasons: steps.map((s) => s.rawFinishReason ?? s.finishReason),
       });
-      return logCall(row(true, totalUsage, steps.length, undefined, steps));
+      return logCall(row(true, totalUsage, steps));
     },
     onError: ({ error }) => {
       span.fail(error);
-      return logCall(row(false, undefined, 1, error));
+      return logCall(row(false, undefined, undefined, error));
     },
     onAbort: () => span.fail("aborted"),
   });

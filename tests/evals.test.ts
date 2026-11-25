@@ -484,3 +484,74 @@ describe("calibrating the judge", () => {
     }
   });
 });
+
+describe("retrying one request after a 5xx", () => {
+  const reply = (status: number, headers: Record<string, string> = {}) =>
+    new Response(status === 200 ? "{}" : "busy", { status, headers });
+
+  it("retries a 503 per request, counts every try and keeps the time it lost", async () => {
+    const { countingFetch } = await import("@/lib/ai/retry-fetch");
+    const responses = [
+      reply(503),
+      reply(503, { "retry-after": "1" }),
+      reply(200),
+    ];
+    const waits: number[] = [];
+    const stats = { attempts: 0, lostMs: 0 };
+    const send = countingFetch(stats, {
+      retries: 4,
+      fetch: async () => responses.shift()!,
+      sleep: async (ms) => {
+        waits.push(ms);
+      },
+    });
+    const response = await send("https://example.test", {
+      method: "POST",
+      body: "{}",
+    });
+    expect(response.status).toBe(200);
+    expect(stats.attempts).toBe(3);
+    expect(waits).toEqual([4000, 1000]);
+    expect(stats.lostMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("never retries a quota error, and gives up after the last retry", async () => {
+    const { countingFetch } = await import("@/lib/ai/retry-fetch");
+    const sleep = async () => {};
+    const quota = { attempts: 0, lostMs: 0 };
+    const quotaResponse = await countingFetch(quota, {
+      retries: 4,
+      fetch: async () => reply(429),
+      sleep,
+    })("https://example.test");
+    expect(quotaResponse.status).toBe(429);
+    expect(quota.attempts).toBe(1);
+
+    const busy = { attempts: 0, lostMs: 0 };
+    const busyResponse = await countingFetch(busy, {
+      retries: 2,
+      fetch: async () => reply(503),
+      sleep,
+    })("https://example.test");
+    expect(busyResponse.status).toBe(503);
+    expect(busy.attempts).toBe(3);
+
+    const off = { attempts: 0, lostMs: 0 };
+    await countingFetch(off, {
+      retries: 0,
+      fetch: async () => reply(503),
+      sleep,
+    })("https://example.test");
+    expect(off.attempts).toBe(1);
+  });
+
+  it("reads AI_RETRY_SERVER_ERRORS, off unless set", async () => {
+    const { serverErrorRetries } = await import("@/lib/ai/retry-fetch");
+    vi.stubEnv("AI_RETRY_SERVER_ERRORS", "");
+    expect(serverErrorRetries()).toBe(0);
+    vi.stubEnv("AI_RETRY_SERVER_ERRORS", "4");
+    expect(serverErrorRetries()).toBe(4);
+    vi.stubEnv("AI_RETRY_SERVER_ERRORS", "lots");
+    expect(serverErrorRetries()).toBe(0);
+  });
+});

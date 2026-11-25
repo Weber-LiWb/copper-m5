@@ -37,7 +37,9 @@ export async function runCase(
       variant,
     });
     const final = await finalValue(progress);
-    const latencyMs = Math.round(performance.now() - started);
+    // Retried 5xx requests and their waits don't count as Ask Copper's time.
+    const lostMs = rows.reduce((sum, row) => sum + (row.lost_ms ?? 0), 0);
+    const latencyMs = Math.round(performance.now() - started - lostMs);
     const failed = rows.find((row) => !row.ok);
     const cutOff = rows.some((row) => row.finish_reasons?.includes(null));
     const error = failed

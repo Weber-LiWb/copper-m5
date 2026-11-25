@@ -8,7 +8,8 @@
 // Options: --variant multi|single (default multi), --threshold 0.8 or 80%,
 // --run-name NAME (default: variant and time), --cases id,id (a subset, for a
 // smoke test), --gap-seconds 30 (the least time from one case's start to the
-// next, so calls stay under Gemini's per-minute limit).
+// next, so calls stay under Gemini's per-minute limit), --max-requests 60
+// (the run stops once it has sent this many Gemini requests).
 import { appendFileSync, existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { LangfuseClient } from "@langfuse/client";
@@ -23,7 +24,7 @@ import {
 import { GOLDEN_SET, type GoldenCase } from "@/lib/evals/golden-set";
 import { judgeAnswer } from "@/lib/evals/judge";
 import { isTransientError, retrying } from "@/lib/evals/retry";
-import { type CaseRun, runCase } from "@/lib/evals/run-case";
+import { type CaseRun, CUT_OFF, runCase } from "@/lib/evals/run-case";
 import {
   isQuotaError,
   meetsThreshold,
@@ -33,10 +34,6 @@ import {
 } from "@/lib/evals/summary";
 
 const DATASET = "copper-golden-set";
-/** Retries for a 503 "high demand", per case or judge call and per run. */
-const RETRIES = 2;
-const RUN_RETRIES = 4;
-const RETRY_WAIT_MS = 20_000;
 const REQUIRED = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
   "LANGFUSE_PUBLIC_KEY",
@@ -45,8 +42,11 @@ const REQUIRED = [
 ];
 
 if (existsSync(".env.local")) process.loadEnvFile(".env.local");
-// A quota error should stop the run, not be retried with more calls.
+// The AI SDK would retry a quota error (429) too, so its retries are off.
+// lib/ai/retry-fetch.ts retries only a request that got a 5xx, up to 4 times
+// (5 tries over about a minute); after that the run stops.
 process.env.AI_MAX_RETRIES ??= "0";
+process.env.AI_RETRY_SERVER_ERRORS ??= "4";
 
 const { values: args } = parseArgs({
   options: {
@@ -55,6 +55,7 @@ const { values: args } = parseArgs({
     "run-name": { type: "string" },
     cases: { type: "string" },
     "gap-seconds": { type: "string" },
+    "max-requests": { type: "string" },
   },
 });
 
@@ -107,6 +108,9 @@ async function main() {
   );
   const gapMs =
     Number(args["gap-seconds"] ?? process.env.EVAL_GAP_SECONDS ?? 30) * 1000;
+  const maxRequests = Number(
+    args["max-requests"] ?? process.env.EVAL_MAX_REQUESTS ?? 60,
+  );
   const wanted = args.cases?.split(",").map((id) => id.trim());
   const cases: GoldenCase[] = wanted
     ? GOLDEN_SET.filter((c) => wanted.includes(c.id))
@@ -137,15 +141,12 @@ async function main() {
   const results = new Map<string, CaseRun>();
   const startedAt = new Map<string, number>();
   let stopped: string | undefined;
-  let retriesLeft = RUN_RETRIES;
-  const retryOptions = (what: string) => ({
-    retries: Math.min(RETRIES, retriesLeft),
-    waitMs: RETRY_WAIT_MS,
-    onRetry: (error: string, attempt: number) => {
-      retriesLeft--;
-      console.log(`  ${what} retry ${attempt} after: ${error}`);
-    },
-  });
+  const sent = () => all.reduce((sum, row) => sum + row.requests, 0);
+  const overBudget = () => {
+    if (!stopped && sent() >= maxRequests)
+      stopped = `reached the run's ceiling of ${maxRequests} Gemini requests`;
+    return Boolean(stopped);
+  };
   // Pacing happens in the evaluator, after the case's trace has ended, so it
   // never counts toward the latency Langfuse shows.
   const pace = async (c: GoldenCase) => {
@@ -153,12 +154,12 @@ async function main() {
     const waited = performance.now() - (startedAt.get(c.id) ?? 0);
     await sleep(Math.max(0, gapMs - waited));
   };
-  // A run that keeps failing measures Gemini's load, not Ask Copper, so once
-  // the run's retries are spent, the next transient error stops it.
+  // A quota error, or a 5xx that outlasted its retries, means the run would
+  // measure Gemini's load rather than Ask Copper, so the run stops.
   const stopIfStuck = (error: string | undefined) => {
     if (isQuotaError(error)) stopped = `Gemini quota error: ${error}`;
-    else if (isTransientError(error) && retriesLeft <= 0)
-      stopped = `Gemini kept failing after ${RUN_RETRIES} retries: ${error}`;
+    else if (isTransientError(error) && error !== CUT_OFF)
+      stopped = `Gemini kept failing: ${error}`;
   };
   const caseOf = (id: string | undefined) => {
     const c = cases.find((g) => itemId(g) === id);
@@ -177,13 +178,18 @@ async function main() {
     data: items,
     maxConcurrency: 1,
     task: async (item) => {
-      if (stopped) throw new Error(`Skipped: ${stopped}`);
+      if (overBudget()) throw new Error(`Skipped: ${stopped}`);
       const c = caseOf("id" in item ? item.id : undefined);
       startedAt.set(c.id, performance.now());
+      // A reply Google cut off mid-stream gets one more try.
       const tries = await retrying(
         () => runCase(c, variant, runName),
-        (r) => (r.status === "error" ? r.error : undefined),
-        retryOptions(c.id),
+        (r) => (r.error === CUT_OFF ? r.error : undefined),
+        {
+          retries: 1,
+          waitMs: 5_000,
+          onRetry: (error) => console.log(`  ${c.id} retry after: ${error}`),
+        },
       );
       // Cost counts every try, as Langfuse does; latency is the last try's.
       const run: CaseRun = {
@@ -212,7 +218,7 @@ async function main() {
         const c = cases.find((g) => g.id === metadata?.caseId);
         const run = c && results.get(c.id);
         if (!c || !run) return [];
-        if (run.status !== "answered" || stopped) {
+        if (run.status !== "answered" || overBudget()) {
           await pace(c);
           return [
             {
@@ -259,9 +265,7 @@ async function main() {
                 String(error),
             }));
         };
-        const judged = (
-          await retrying(judge, (r) => r.error, retryOptions(`${c.id} judge`))
-        ).at(-1)!;
+        const judged = await judge();
         if (!judged.verdict) {
           const message = judged.error ?? "no verdict";
           run.status = "error";
@@ -300,6 +304,8 @@ async function main() {
     ],
     runEvaluators: [
       async () => {
+        // A stopped run's numbers aren't a result, so it gets no run scores.
+        if (stopped) return [];
         const summary = summarize(cases, [...results.values()]);
         return [
           {
