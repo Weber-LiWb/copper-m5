@@ -122,6 +122,9 @@ export function AskCopper({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note, busy]);
 
+  // One id per conversation, so Langfuse groups its turns into a session.
+  const sessions = useRef<Partial<Record<keyof Chats, string>>>({});
+
   async function send(question: string, note = false) {
     question = question.trim();
     if (!question || busy) return;
@@ -152,6 +155,7 @@ export function AskCopper({
       const { progress } = await askCopper({
         messages,
         useTools: chat === "tools",
+        sessionId: (sessions.current[chat] ??= crypto.randomUUID()),
         // Module 4: the console's desk, and who is talking. A console note
         // always goes to the Refund agent.
         ...(support && {

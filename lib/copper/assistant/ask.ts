@@ -9,24 +9,32 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: each turn is one Langfuse trace, grouped by the chat's session.
+// The eval can ask for the single-agent variant: one Support agent with every
+// tool and no handoff. The app always uses the two agents.
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
+import { flushTracing, traceTurn } from "@/lib/ai/tracing";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
-import type {
-  Agent,
-  Progress,
-  ToolStep,
+import {
+  type Agent,
+  AGENT_NAMES,
+  type Progress,
+  type ToolStep,
 } from "@/lib/copper/assistant/progress";
 import {
   copperTools,
   refundAgentTools,
+  supportAgentTools,
   transferToRefundAgent,
 } from "@/lib/copper/assistant/tools";
+import type { Variant } from "@/lib/copper/assistant/variants";
 import type { Desk } from "@/lib/copper/orders";
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
@@ -38,6 +46,10 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /** The chat this turn belongs to, so Langfuse groups its turns (Module 5). */
+  sessionId?: string;
+  /** Two agents (the app) or one Support agent (Module 5's comparison). */
+  variant?: Variant;
 };
 
 export type AskCopperResult = { progress: Live<Progress> };
@@ -63,9 +75,20 @@ const SORRY = "Sorry, something went wrong on my end. Please try again.";
 
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
+  if (agent === "support" && desk)
+    return callStream(
+      { module: 5, feature: "support-agent", agent: AGENT_NAMES.support },
+      {
+        messages,
+        providerOptions: THOUGHT_SUMMARIES,
+        instructions: SUPPORT_AGENT_INSTRUCTIONS,
+        tools: supportAgentTools(desk),
+        stopWhen: STOP,
+      },
+    );
   if (agent === "refund" && desk)
     return callStream(
-      { module: 4, feature: "refund-agent" },
+      { module: 4, feature: "refund-agent", agent: AGENT_NAMES.refund },
       {
         messages,
         providerOptions: THOUGHT_SUMMARIES,
@@ -75,7 +98,7 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
       },
     );
   return callStream(
-    { module: 2, feature: "ask-copper" },
+    { module: 2, feature: "ask-copper", agent: AGENT_NAMES.copper },
     {
       messages,
       providerOptions: THOUGHT_SUMMARIES,
@@ -90,14 +113,23 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
   );
 }
 
+/** Who answers first in this variant. */
+function firstAgent(variant: Variant, agent: Agent, handoffs: boolean): Agent {
+  if (!handoffs) return "copper";
+  if (variant === "single") return "support";
+  return agent === "support" ? "copper" : agent;
+}
+
 export async function askCopper({
   messages,
   useTools,
   desk,
   agent = "copper",
+  sessionId,
+  variant = "multi",
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
-  const first: Agent = desk && useTools ? agent : "copper";
+  const first = firstAgent(variant, agent, Boolean(desk && useTools));
   const progress: Progress = {
     steps: [],
     reply: "",
@@ -191,7 +223,9 @@ export async function askCopper({
   }
 
   // Read the stream in the background, so the panel gets the first update now.
-  void (async () => {
+  let started = false;
+  const answer = async () => {
+    started = true;
     try {
       if (!useTools) {
         // Without tools, send no instructions either: "always use your
@@ -224,8 +258,42 @@ export async function askCopper({
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
     }
-    done(snapshot());
-  })();
+  };
+
+  void traceTurn(
+    {
+      name: "ask-copper",
+      sessionId,
+      input: messages.at(-1)?.content,
+      tags: [variant === "single" ? "single-agent" : "multi-agent"],
+      metadata: { variant, page: desk ? "support" : "home" },
+    },
+    async (turn) => {
+      await answer();
+      const agents = [
+        first,
+        ...progress.steps.flatMap((step) =>
+          step.type === "handoff" ? [step.to] : [],
+        ),
+      ];
+      turn.update({
+        output: progress.reply,
+        metadata: {
+          answeredBy: AGENT_NAMES[progress.agent ?? "copper"],
+          agents: agents.map((a) => AGENT_NAMES[a]),
+          status: progress.status,
+        },
+      });
+    },
+  )
+    // Tracing must never cost the customer their answer.
+    .catch(async () => {
+      if (!started) await answer();
+    })
+    .finally(() => {
+      done(snapshot());
+      void flushTracing().catch(() => {});
+    });
 
   return { progress: live };
 }

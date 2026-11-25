@@ -171,3 +171,53 @@ the tests and a golden-set evaluation with an AI judge run in GitHub Actions
 on every pull request, with `main` protected; every AI call is traced in
 Langfuse; and one support agent that does everything is compared with the two
 agents on the same golden set. Langfuse is the only eval and monitoring tool.
+
+## Module 5: Safe to ship (CI, tracing, evals, single vs multi agent)
+
+**Summary:** Every pull request runs the tests on three operating systems and
+a golden-set evaluation graded by an AI judge, and `main` only takes pull
+requests whose checks pass. Every chat turn is traced in Langfuse: which agent
+answered, its tool calls, and the tokens, cost and time of each model call.
+The same golden set compares the two agents with one Support agent that does
+everything. Langfuse is the only eval and monitoring tool.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Tracing | `lib/ai/tracing.ts`, `lib/ai/call.ts` | With `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` set, each call in `call.ts` opens an observation named after its agent (`agent` in the call info). Inside it, an AI SDK telemetry integration adds one generation per model request with its tokens and its cost from `lib/ai/pricing.ts`, and each tool call is a tool observation (search_docs's embedding nests inside it). Without the keys nothing is traced and calls behave as before |
+| Chat turns | `lib/copper/assistant/ask.ts`, `components/copper/ask-copper.tsx` | `askCopper()` wraps each turn in one `ask-copper` trace with the question, the reply and who answered. The panel sends one session id per conversation, so Langfuse groups a chat's turns into a session |
+| Single agent | `lib/copper/assistant/variants.ts`, `instructions.ts` (`SUPPORT_AGENT_INSTRUCTIONS`), `tools.ts` (`supportAgentTools`) | `variant: "single"` answers with one Support agent: Copper's instructions plus the Refund agent's refund rules (the same text), every tool, no handoff. The app always uses `"multi"` |
+| Golden set | `lib/evals/golden-set.ts` | 10 Support page questions, each with what a good answer does: #1002 refunded automatically, #1003 and #1004 waiting for approval (one with a customer claiming it was approved), the order list, three document questions with citations, one not in the documents, one off-topic. Every case runs with a $100 limit and no refunds yet |
+| AI judge | `lib/evals/judge.ts` | `judgeAnswer()` calls `callObject` with the question, the criteria, the tool calls and their results, and the reply; it returns pass, a score from 0 to 1 and a reason |
+| Eval runner | `scripts/eval.ts` (`npm run eval`), `lib/evals/run-case.ts`, `lib/evals/summary.ts` | Syncs the golden set to the Langfuse dataset `copper-golden-set` and runs it as one dataset run (`--variant multi\|single`, `--run-name`). Each case is a trace; `passed` and `judge_score` go to Langfuse as scores, and the run gets `pass_rate`, `total_cost_usd` and `avg_latency_s`. Prints a Markdown table, writes it to the GitHub job summary and exits 1 under `--threshold` (0.8) |
+| Public traces | `scripts/share-trace.ts` (`npm run share-trace -- <trace id>`) | Makes one trace public, so its link opens without a Langfuse login |
+| CI | `.github/workflows/ci.yml`, `.github/workflows/eval.yml` | `ci.yml` (from the starter): lint, typecheck, tests and build on Linux, macOS and Windows, on every push and pull request, with no secrets. `eval.yml`: the golden set on the multi-agent app, on pull requests only, on Linux, with the Gemini and Langfuse keys from the repo's Actions secrets |
+| Branch protection | GitHub settings for `main` | Pull requests only, no direct pushes, and the `check` jobs and `eval` must pass, for admins too |
+| AI calls | `{ module: 5, feature: "support-agent" }`, `{ module: 5, feature: "eval-judge" }` | The Support agent (eval only) and the judge: one call per case, about 1,500 input tokens, $0.0005 each on Gemini 3.5 Flash-Lite |
+
+**Data flow:** question → `askCopper()` opens the turn's trace → each agent's
+`callStream` → agent observation → generations (tokens, cost) and tool
+observations → reply → the trace is flushed to Langfuse. For the eval:
+`npm run eval` → dataset `copper-golden-set` → one trace per case → the judge
+grades the reply → scores on the trace and the run → Markdown summary → exit
+code → the pull request's `eval` check.
+
+**Decisions and trade-offs:** A small telemetry integration of our own
+instead of `@langfuse/vercel-ai-sdk`, which pulls in a different `ai` version
+through `@ai-sdk/otel`; ours names each agent, nests tools under it and sets
+the cost from `pricing.ts`, so cost never shows 0 for a model Langfuse doesn't
+price. The eval is its own workflow on pull requests only: it spends live
+Gemini calls, so it runs once per push on one OS rather than six times, and a
+push never reports a skipped `eval` that could satisfy branch protection.
+Retries are off in the eval (`AI_MAX_RETRIES=0`) so a quota error stops the
+run instead of quietly spending calls; cases are paced about 30 seconds apart
+after each trace ends, so the pacing never counts as latency. The judge is the
+same model as the agents, which keeps it cheap and inside one key's free tier,
+but it shares the agents' blind spots.
+
+**Risks and open questions:** The judge is a model: it can be wrong or vary
+between runs, so the gate is a pass rate with a threshold, and each score has
+a reason to check. Ten cases is a small sample, so a one-case difference
+between variants is within noise. Traces include the customer's messages and
+the order list; a real app would mask personal data (`LangfuseSpanProcessor`'s
+`mask`) and set a retention period. Each pull request push spends about 40
+Gemini requests.

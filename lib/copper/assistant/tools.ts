@@ -295,6 +295,15 @@ export const transferToRefundAgent = tool({
 
 /** The Refund agent's own tools (Module 4). Copper can't use these. */
 export function refundAgentTools(desk: Desk) {
+  return { ...orderTools(desk), transfer_to_copper: transferToCopper };
+}
+
+/** Module 5: the single Support agent has every tool and no handoff. */
+export function supportAgentTools(desk: Desk) {
+  return { ...copperTools, ...orderTools(desk) };
+}
+
+function orderTools(desk: Desk) {
   return {
     get_orders: tool({
       description:
@@ -310,13 +319,14 @@ export function refundAgentTools(desk: Desk) {
       }),
       execute: async ({ orderId }) => requestRefund(orderId, desk),
     }),
-    transfer_to_copper: tool({
-      description:
-        "Hands the customer back to Copper for anything that isn't a refund (products, prices, stock, setup, policies). Copper answers next, so write no reply of your own.",
-      inputSchema: z.object({
-        reason: z.string().describe("Why, in a few words."),
-      }),
-      execute: async () => ({ handedTo: "Copper" }),
-    }),
   };
 }
+
+const transferToCopper = tool({
+  description:
+    "Hands the customer back to Copper for anything that isn't a refund (products, prices, stock, setup, policies). Copper answers next, so write no reply of your own.",
+  inputSchema: z.object({
+    reason: z.string().describe("Why, in a few words."),
+  }),
+  execute: async () => ({ handedTo: "Copper" }),
+});

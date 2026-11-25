@@ -1,0 +1,37 @@
+name: Eval
+
+# The golden-set eval with the AI judge (Module 5): npm run eval. It makes
+# live Gemini calls, so it runs only on pull requests, on Linux, with the
+# multi-agent app (the app's default), and fails below an 80% pass rate.
+# It's its own workflow so a push never reports a skipped "eval" check that
+# could satisfy branch protection.
+on:
+  pull_request:
+
+# A newer push to the same pull request replaces the run in progress.
+concurrency:
+  group: eval-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Golden-set eval (multi-agent, AI judge)
+        run: >-
+          npm run eval --
+          --variant multi
+          --threshold 0.8
+          --run-name "ci pr${{ github.event.pull_request.number }} run ${{ github.run_id }}-${{ github.run_attempt }}"
+        env:
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
