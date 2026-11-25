@@ -6,7 +6,11 @@ import type { Verdict } from "@/lib/evals/judge";
 
 export type CaseResult = {
   id: string;
-  /** answered: the agent replied; error: it failed, so it isn't judged. */
+  /**
+   * answered: judged, pass or fail. error: the agent's or the judge's call
+   * failed (a 503, a reply cut off), so there's no grade; it counts as not
+   * passed.
+   */
   status: "answered" | "error";
   answeredBy?: string;
   verdict?: Verdict;
@@ -21,6 +25,8 @@ export type CaseResult = {
 export type RunSummary = {
   total: number;
   passed: number;
+  /** Cases with no grade: an API error, a cut-off reply, or never run. */
+  errors: number;
   /** passed / total. A case with no result (skipped, crashed) counts as failed. */
   passRate: number;
   avgScore: number;
@@ -42,6 +48,7 @@ export function summarize(
   return {
     total,
     passed,
+    errors: total - ran.filter((r) => r.status === "answered").length,
     passRate: total ? passed / total : 0,
     avgScore: total ? sum(ran.map((r) => r.verdict?.score ?? 0)) / total : 0,
     totalCostUsd: sum(ran.map((r) => r.costUsd)),
@@ -113,7 +120,7 @@ export function summaryMarkdown(run: {
   return [
     `## ${run.title}`,
     "",
-    `**Pass rate: ${summary.passed}/${summary.total} (${percent(summary.passRate)})**, threshold ${percent(run.threshold)}: **${gate}**`,
+    `**Pass rate: ${summary.passed}/${summary.total} (${percent(summary.passRate)})**, threshold ${percent(run.threshold)}: **${gate}**${summary.errors ? ` · ${summary.errors} not graded (errors)` : ""}`,
     "",
     `Run \`${run.runName}\` · model and judge \`${run.model}\` · average judge score ${summary.avgScore.toFixed(2)}`,
     "",

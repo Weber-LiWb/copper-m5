@@ -25,6 +25,7 @@ import {
 import {
   type Agent,
   AGENT_NAMES,
+  FALLBACK_REPLY,
   type Progress,
   type ToolStep,
 } from "@/lib/copper/assistant/progress";
@@ -71,7 +72,6 @@ const STOP = [
   hasToolCall("transfer_to_refund_agent", "transfer_to_copper"),
 ];
 
-const SORRY = "Sorry, something went wrong on my end. Please try again.";
 
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
@@ -253,10 +253,10 @@ export async function askCopper({
         }
       }
       progress.status = "done";
-      if (!progress.reply.trim()) progress.reply = SORRY;
+      if (!progress.reply.trim()) progress.reply = FALLBACK_REPLY;
     } catch {
       progress.status = "error";
-      if (!progress.reply.trim()) progress.reply = SORRY;
+      if (!progress.reply.trim()) progress.reply = FALLBACK_REPLY;
     }
   };
 

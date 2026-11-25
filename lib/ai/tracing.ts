@@ -223,7 +223,7 @@ function traceTools<TOOLS extends ToolSet>(
 export type CallSpan = {
   telemetry?: { functionId: string; integrations: Telemetry };
   tools<TOOLS extends ToolSet | undefined>(tools: TOOLS): TOOLS;
-  end(output?: unknown): void;
+  end(output?: unknown, metadata?: Record<string, unknown>): void;
   fail(error: unknown): void;
 };
 
@@ -263,7 +263,7 @@ export function traceCall(call: CallTrace): CallSpan {
       integrations: generations(span, call.model),
     },
     tools: (tools) => (tools ? traceTools(tools, span) : tools),
-    end: (output) => close({ output }),
+    end: (output, metadata) => close({ output, metadata }),
     fail: (error) =>
       close({ level: "ERROR", statusMessage: errorMessage(error) }),
   };

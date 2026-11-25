@@ -66,6 +66,11 @@ export type AiCallRow = {
   ok: boolean;
   /** Model requests the call made: one per step (tool calls plus the reply). */
   requests: number;
+  /**
+   * Google's reason each step stopped, like "STOP". Null means the stream
+   * ended with no reason at all: Google cut it off.
+   */
+  finish_reasons?: (string | null)[];
   /** Why it failed, like "429 Resource has been exhausted". */
   error?: string;
   created_at: string;
@@ -136,6 +141,7 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
     usage?: Usage,
     requests = 1,
     error?: unknown,
+    steps?: { rawFinishReason?: string }[],
   ): AiCallRow => {
     const input = usage?.inputTokens ?? null;
     const output = usage?.outputTokens ?? null;
@@ -152,6 +158,9 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
       latency_ms: Math.round(performance.now() - started),
       ok,
       requests,
+      ...(steps && {
+        finish_reasons: steps.map((s) => s.rawFinishReason ?? null),
+      }),
       ...(error !== undefined && { error: describeError(error) }),
       created_at: new Date().toISOString(),
     };
@@ -184,7 +193,11 @@ function settings(model: ModelId, span: CallSpan, tools: ToolSet | undefined) {
 }
 
 async function tracked<
-  T extends { usage: Usage; steps: unknown[]; text: string },
+  T extends {
+    usage: Usage;
+    steps: { rawFinishReason?: string }[];
+    text: string;
+  },
 >(
   info: CallInfo,
   options: TextOptions,
@@ -198,7 +211,9 @@ async function tracked<
   try {
     const result = await run(settings(model, span, options.tools));
     span.end(result.text);
-    await logCall(row(true, result.usage, result.steps.length));
+    await logCall(
+      row(true, result.usage, result.steps.length, undefined, result.steps),
+    );
     return result;
   } catch (error) {
     span.fail(error);
@@ -302,8 +317,12 @@ export function callStream(info: CallInfo, options: StreamOptions) {
     ...options,
     ...settings(model, span, options.tools),
     onFinish: ({ totalUsage, steps, text }) => {
-      span.end(text);
-      return logCall(row(true, totalUsage, steps.length));
+      // Google's own reason each step stopped (STOP, MAX_TOKENS, ...), which
+      // the AI SDK folds into "other" when it has no name for it.
+      span.end(text, {
+        finishReasons: steps.map((s) => s.rawFinishReason ?? s.finishReason),
+      });
+      return logCall(row(true, totalUsage, steps.length, undefined, steps));
     },
     onError: ({ error }) => {
       span.fail(error);

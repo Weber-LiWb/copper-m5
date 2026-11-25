@@ -287,7 +287,7 @@ type StreamPart = Parameters<
 describe("running one case", () => {
   const finish: StreamPart = {
     type: "finish",
-    finishReason: { unified: "stop", raw: undefined },
+    finishReason: { unified: "stop", raw: "STOP" },
     usage: {
       inputTokens: {
         total: 1000,
@@ -338,5 +338,134 @@ describe("running one case", () => {
     expect(run.status).toBe("error");
     expect(run.latencyMs).toBeUndefined();
     expect(isQuotaError(run.error)).toBe(true);
+  });
+});
+
+describe("retrying a busy Gemini", () => {
+  it("retries a 503 but never a quota error", async () => {
+    const { isTransientError, retrying } = await import("@/lib/evals/retry");
+    expect(
+      isTransientError("503 This model is currently experiencing high demand."),
+    ).toBe(true);
+    expect(isTransientError("fetch failed")).toBe(true);
+    expect(isTransientError("429 Resource has been exhausted")).toBe(false);
+    expect(isTransientError("400 Invalid argument")).toBe(false);
+    expect(isTransientError(undefined)).toBe(false);
+
+    const waits: number[] = [];
+    const sleep = async (ms: number) => {
+      waits.push(ms);
+    };
+    const answers = ["503 high demand", "503 high demand", undefined];
+    const tries = await retrying(
+      async () => answers.shift(),
+      (error) => error,
+      { retries: 2, waitMs: 100, sleep },
+    );
+    expect(tries).toEqual(["503 high demand", "503 high demand", undefined]);
+    expect(waits).toEqual([100, 200]);
+
+    const quota = await retrying(
+      async () => "429 quota",
+      (error) => error,
+      { retries: 2, waitMs: 100, sleep },
+    );
+    expect(quota).toHaveLength(1);
+
+    const giveUp = await retrying(
+      async () => "503 high demand",
+      (error) => error,
+      { retries: 1, waitMs: 100, sleep },
+    );
+    expect(giveUp).toHaveLength(2);
+  });
+});
+
+describe("telling Gemini's glitches from wrong answers", () => {
+  const usage = {
+    inputTokens: {
+      total: 900,
+      noCache: 900,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 30, text: 30, reasoning: undefined },
+  };
+  const streaming = (parts: StreamPart[]) =>
+    new MockLanguageModelV4({
+      doStream: async () => ({ stream: convertArrayToReadableStream(parts) }),
+    });
+
+  it("logs Google's raw finish reasons on each ai_calls row", async () => {
+    model = streaming([
+      { type: "text-start", id: "t" },
+      { type: "text-delta", id: "t", delta: "Hi." },
+      { type: "text-end", id: "t" },
+      { type: "finish", finishReason: { unified: "stop", raw: "STOP" }, usage },
+    ]);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.resetModules();
+    const { runCase } = await import("@/lib/evals/run-case");
+    await runCase(GOLDEN_SET.at(-1)!, "multi", "run-1");
+    const row = JSON.parse(
+      info.mock.calls.find(([tag]) => tag === "[ai_calls]")![1] as string,
+    );
+    expect(row.finish_reasons).toEqual(["STOP"]);
+  });
+
+  it("treats a stream with no finish reason as cut off: an error worth a retry", async () => {
+    model = streaming([
+      { type: "text-start", id: "t" },
+      { type: "text-delta", id: "t", delta: "I've" },
+      { type: "text-end", id: "t" },
+    ]);
+    vi.resetModules();
+    const { CUT_OFF, runCase } = await import("@/lib/evals/run-case");
+    const { isTransientError } = await import("@/lib/evals/retry");
+    const run = await runCase(GOLDEN_SET[0], "multi", "run-1");
+    expect(run).toMatchObject({ status: "error", error: CUT_OFF });
+    expect(run.verdict).toBeUndefined();
+    expect(isTransientError(run.error)).toBe(true);
+  });
+
+  it("fails a turn the model ended without a reply, without asking the judge", async () => {
+    model = streaming([
+      { type: "reasoning-start", id: "r" },
+      { type: "reasoning-delta", id: "r", delta: "Thinking about it" },
+      { type: "reasoning-end", id: "r" },
+      {
+        type: "finish",
+        finishReason: { unified: "other", raw: "OTHER" },
+        usage,
+      },
+    ]);
+    vi.resetModules();
+    const { runCase } = await import("@/lib/evals/run-case");
+    const run = await runCase(GOLDEN_SET[0], "multi", "run-1");
+    expect(run.status).toBe("answered");
+    expect(run.verdict).toMatchObject({ pass: false, score: 0 });
+    expect(run.verdict!.reason).toContain("OTHER");
+  });
+
+  it("counts errors and never-run cases as ungraded", () => {
+    const cases = GOLDEN_SET.slice(0, 3);
+    const summary = summarize(cases, [
+      {
+        id: cases[0].id,
+        status: "answered",
+        verdict: { pass: true, score: 1, reason: "" },
+        latencyMs: 1,
+        costUsd: 0,
+        requests: 1,
+      },
+      {
+        id: cases[1].id,
+        status: "error",
+        costUsd: 0,
+        requests: 1,
+        error: "503",
+      },
+    ]);
+    expect(summary).toMatchObject({ passed: 1, errors: 2, total: 3 });
   });
 });

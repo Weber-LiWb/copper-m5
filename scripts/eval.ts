@@ -22,6 +22,7 @@ import {
 } from "@/lib/copper/assistant/variants";
 import { GOLDEN_SET, type GoldenCase } from "@/lib/evals/golden-set";
 import { judgeAnswer } from "@/lib/evals/judge";
+import { isTransientError, retrying } from "@/lib/evals/retry";
 import { type CaseRun, runCase } from "@/lib/evals/run-case";
 import {
   isQuotaError,
@@ -32,6 +33,10 @@ import {
 } from "@/lib/evals/summary";
 
 const DATASET = "copper-golden-set";
+/** Retries for a 503 "high demand", per case or judge call and per run. */
+const RETRIES = 2;
+const RUN_RETRIES = 4;
+const RETRY_WAIT_MS = 20_000;
 const REQUIRED = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
   "LANGFUSE_PUBLIC_KEY",
@@ -122,8 +127,9 @@ async function main() {
   });
   startTracing();
   const dataset = await syncDataset(langfuse);
-  const items = dataset.items.filter((item) =>
-    cases.some((c) => item.id === `copper-golden-${c.id}`),
+  const itemId = (c: GoldenCase) => `copper-golden-${c.id}`;
+  const items = cases.flatMap(
+    (c) => dataset.items.find((item) => item.id === itemId(c)) ?? [],
   );
 
   const all: AiCallRow[] = [];
@@ -131,6 +137,15 @@ async function main() {
   const results = new Map<string, CaseRun>();
   const startedAt = new Map<string, number>();
   let stopped: string | undefined;
+  let retriesLeft = RUN_RETRIES;
+  const retryOptions = (what: string) => ({
+    retries: Math.min(RETRIES, retriesLeft),
+    waitMs: RETRY_WAIT_MS,
+    onRetry: (error: string, attempt: number) => {
+      retriesLeft--;
+      console.log(`  ${what} retry ${attempt} after: ${error}`);
+    },
+  });
   // Pacing happens in the evaluator, after the case's trace has ended, so it
   // never counts toward the latency Langfuse shows.
   const pace = async (c: GoldenCase) => {
@@ -138,8 +153,15 @@ async function main() {
     const waited = performance.now() - (startedAt.get(c.id) ?? 0);
     await sleep(Math.max(0, gapMs - waited));
   };
+  // A run that keeps failing measures Gemini's load, not Ask Copper, so once
+  // the run's retries are spent, the next transient error stops it.
+  const stopIfStuck = (error: string | undefined) => {
+    if (isQuotaError(error)) stopped = `Gemini quota error: ${error}`;
+    else if (isTransientError(error) && retriesLeft <= 0)
+      stopped = `Gemini kept failing after ${RUN_RETRIES} retries: ${error}`;
+  };
   const caseOf = (id: string | undefined) => {
-    const c = cases.find((g) => `copper-golden-${g.id}` === id);
+    const c = cases.find((g) => itemId(g) === id);
     if (!c) throw new Error(`Unknown dataset item ${id}.`);
     return c;
   };
@@ -158,12 +180,22 @@ async function main() {
       if (stopped) throw new Error(`Skipped: ${stopped}`);
       const c = caseOf("id" in item ? item.id : undefined);
       startedAt.set(c.id, performance.now());
-      const run = await runCase(c, variant, runName);
+      const tries = await retrying(
+        () => runCase(c, variant, runName),
+        (r) => (r.status === "error" ? r.error : undefined),
+        retryOptions(c.id),
+      );
+      // Cost counts every try, as Langfuse does; latency is the last try's.
+      const run: CaseRun = {
+        ...tries.at(-1)!,
+        costUsd: tries.reduce((sum, t) => sum + t.costUsd, 0),
+        requests: tries.reduce((sum, t) => sum + t.requests, 0),
+      };
       results.set(c.id, run);
       console.log(
-        `${c.id}: ${run.status}, ${run.answeredBy}, ${run.requests} requests${run.error ? `, ${run.error}` : ""}`,
+        `${c.id}: ${run.status}, ${run.answeredBy}, ${run.requests} requests${tries.length > 1 ? ` in ${tries.length} tries` : ""}${run.error ? `, ${run.error}` : ""}`,
       );
-      if (isQuotaError(run.error)) stopped = `Gemini quota error: ${run.error}`;
+      if (run.status === "error") stopIfStuck(run.error);
       return {
         reply: run.reply,
         answeredBy: run.answeredBy,
@@ -191,8 +223,22 @@ async function main() {
             },
           ];
         }
-        try {
-          run.verdict = await traceTurn(
+        // No reply to grade: runCase already failed it, without a judge call.
+        if (run.verdict) {
+          console.log(`  no reply: ${run.verdict.reason}`);
+          await pace(c);
+          return [
+            {
+              name: "passed",
+              value: 0,
+              dataType: "BOOLEAN",
+              comment: run.verdict.reason,
+            },
+          ];
+        }
+        const judge = () => {
+          const before = all.length;
+          return traceTurn(
             {
               name: "eval-judge",
               sessionId: runName,
@@ -204,21 +250,34 @@ async function main() {
               turn.update({ output: verdict });
               return verdict;
             },
-          );
-        } catch (error) {
-          const message =
-            all.findLast((row) => !row.ok)?.error ?? String(error);
-          if (isQuotaError(message)) stopped = `Gemini quota error: ${message}`;
+          )
+            .then((verdict) => ({ verdict, error: undefined }))
+            .catch((error) => ({
+              verdict: undefined,
+              error:
+                all.slice(before).find((row) => !row.ok)?.error ??
+                String(error),
+            }));
+        };
+        const judged = (
+          await retrying(judge, (r) => r.error, retryOptions(`${c.id} judge`))
+        ).at(-1)!;
+        if (!judged.verdict) {
+          const message = judged.error ?? "no verdict";
+          run.status = "error";
+          run.error = `Judge failed: ${message}`;
+          stopIfStuck(message);
           await pace(c);
           return [
             {
               name: "passed",
               value: 0,
               dataType: "BOOLEAN",
-              comment: `Judge failed: ${message}`,
+              comment: run.error,
             },
           ];
         }
+        run.verdict = judged.verdict;
         console.log(
           `  judge: ${run.verdict.pass ? "pass" : "fail"} (${run.verdict.score}) ${run.verdict.reason}`,
         );

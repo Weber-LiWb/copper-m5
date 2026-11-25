@@ -41,6 +41,10 @@ export type Progress = {
   agent?: Agent;
 };
 
+/** What Ask Copper says when the model fails or sends no reply. */
+export const FALLBACK_REPLY =
+  "Sorry, something went wrong on my end. Please try again.";
+
 /** Every tool call in an answer, in order. */
 export function toolCallsOf(progress: Progress) {
   return progress.steps
