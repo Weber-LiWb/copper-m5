@@ -469,3 +469,18 @@ describe("telling Gemini's glitches from wrong answers", () => {
     expect(summary).toMatchObject({ passed: 1, errors: 2, total: 3 });
   });
 });
+
+describe("calibrating the judge", () => {
+  it("has good and bad replies, with known grades, for real golden cases", async () => {
+    const { CALIBRATION, caseFor } =
+      await import("@/lib/evals/judge-calibration");
+    expect(CALIBRATION.filter((e) => e.pass).length).toBe(
+      CALIBRATION.filter((e) => !e.pass).length,
+    );
+    expect(new Set(CALIBRATION.map((e) => e.id)).size).toBe(CALIBRATION.length);
+    for (const example of CALIBRATION) {
+      expect(caseFor(example).id).toBe(example.caseId);
+      expect(example.why).not.toBe("");
+    }
+  });
+});

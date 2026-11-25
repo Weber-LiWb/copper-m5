@@ -17,7 +17,8 @@
     "env:check": "node scripts/check-env.mjs",
     "embed-docs": "node scripts/embed-docs.mjs",
     "eval": "tsx scripts/eval.ts",
-    "share-trace": "tsx scripts/share-trace.ts"
+    "share-trace": "tsx scripts/share-trace.ts",
+    "calibrate-judge": "tsx scripts/calibrate-judge.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "4.0.93",

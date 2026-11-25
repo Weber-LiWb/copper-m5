@@ -216,7 +216,7 @@ async function main() {
           await pace(c);
           return [
             {
-              name: "passed",
+              name: "meets_criteria",
               value: 0,
               dataType: "BOOLEAN",
               comment: `Not judged: ${run.error ?? stopped}`,
@@ -229,7 +229,7 @@ async function main() {
           await pace(c);
           return [
             {
-              name: "passed",
+              name: "meets_criteria",
               value: 0,
               dataType: "BOOLEAN",
               comment: run.verdict.reason,
@@ -240,7 +240,7 @@ async function main() {
           const before = all.length;
           return traceTurn(
             {
-              name: "eval-judge",
+              name: "grade-answer",
               sessionId: runName,
               input: { case: c.id, reply: run.reply },
               tags: ["judge", `${variant}-agent`],
@@ -270,7 +270,7 @@ async function main() {
           await pace(c);
           return [
             {
-              name: "passed",
+              name: "meets_criteria",
               value: 0,
               dataType: "BOOLEAN",
               comment: run.error,
@@ -284,13 +284,13 @@ async function main() {
         await pace(c);
         return [
           {
-            name: "passed",
+            name: "meets_criteria",
             value: run.verdict.pass ? 1 : 0,
             dataType: "BOOLEAN",
             comment: run.verdict.reason,
           },
           {
-            name: "judge_score",
+            name: "criteria_score",
             value: run.verdict.score,
             dataType: "NUMERIC",
             comment: run.verdict.reason,

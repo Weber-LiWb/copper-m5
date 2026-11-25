@@ -236,15 +236,15 @@ describe("tracing with Langfuse keys", () => {
       "ask-copper (chain)": [
         {
           "Copper (agent)": [
-            "mock-model-id (generation)",
+            "llm-call (generation)",
             "transfer_to_refund_agent (tool)",
           ],
         },
         {
           "Refund agent (agent)": [
-            "mock-model-id (generation)",
+            "llm-call (generation)",
             "request_refund (tool)",
-            "mock-model-id (generation)",
+            "llm-call (generation)",
           ],
         },
       ],
@@ -254,7 +254,8 @@ describe("tracing with Langfuse keys", () => {
     expect(langfuse.propagated[0]).toMatchObject({
       traceName: "ask-copper",
       sessionId: "chat-1",
-      tags: ["multi-agent"],
+      userId: "maya-reyes",
+      tags: ["multi-agent", "support-page"],
     });
     expect(merged(turn)).toMatchObject({
       input: "Refund order 1002, please.",
@@ -295,9 +296,9 @@ describe("tracing with Langfuse keys", () => {
     const copper = langfuse.roots[0].children[0];
     expect(outline(copper)).toEqual({
       "Copper (agent)": [
-        "mock-model-id (generation)",
-        { "search_docs (tool)": ["search-docs (embedding)"] },
-        "mock-model-id (generation)",
+        "llm-call (generation)",
+        { "search_docs (retriever)": ["search-docs (embedding)"] },
+        "llm-call (generation)",
       ],
     });
   });
@@ -314,14 +315,16 @@ describe("tracing with Langfuse keys", () => {
       "ask-copper (chain)": [
         {
           "Support agent (agent)": [
-            "mock-model-id (generation)",
+            "llm-call (generation)",
             "request_refund (tool)",
-            "mock-model-id (generation)",
+            "llm-call (generation)",
           ],
         },
       ],
     });
-    expect(langfuse.propagated[0]).toMatchObject({ tags: ["single-agent"] });
+    expect(langfuse.propagated[0]).toMatchObject({
+      tags: ["single-agent", "support-page"],
+    });
   });
 
   it("marks a failed model call as an error and still ends every observation", async () => {
@@ -365,5 +368,44 @@ describe("without Langfuse keys", () => {
     expect(progress).toMatchObject({ status: "done", agent: "refund" });
     expect(langfuse.roots).toEqual([]);
     expect(langfuse.propagated).toEqual([]);
+  });
+});
+
+describe("what leaves the server", () => {
+  it("masks emails, phone numbers and card numbers, leaving order numbers and prices", async () => {
+    const { maskPii } = await import("@/lib/ai/tracing");
+    expect(
+      maskPii(
+        "Email maya@example.com or call 480-555-0199 about #1002 ($79), card 4242 4242 4242 4242.",
+      ),
+    ).toBe("Email [email] or call [phone] about #1002 ($79), card [card].");
+    expect(
+      maskPii({
+        messages: [{ role: "user", content: "it's 4111111111111111" }],
+        total: 79,
+        id: "call_16768731073866553080",
+        when: "2026-11-05",
+      }),
+    ).toEqual({
+      messages: [{ role: "user", content: "it's [card]" }],
+      total: 79,
+      id: "call_16768731073866553080",
+      when: "2026-11-05",
+    });
+    expect(maskPii("order 1234567890123")).toBe("order 1234567890123");
+  });
+
+  it("labels traces with an environment, so tests stay out of production", async () => {
+    const { tracingEnvironment } = await import("@/lib/ai/tracing");
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "");
+    vi.stubEnv("CI", "");
+    vi.stubEnv("NODE_ENV", "development");
+    expect(tracingEnvironment()).toBe("development");
+    vi.stubEnv("NODE_ENV", "production");
+    expect(tracingEnvironment()).toBe("production");
+    vi.stubEnv("CI", "true");
+    expect(tracingEnvironment()).toBe("ci");
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "staging");
+    expect(tracingEnvironment()).toBe("staging");
   });
 });

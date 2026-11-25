@@ -36,7 +36,7 @@ import {
   transferToRefundAgent,
 } from "@/lib/copper/assistant/tools";
 import type { Variant } from "@/lib/copper/assistant/variants";
-import type { Desk } from "@/lib/copper/orders";
+import { CUSTOMER, type Desk } from "@/lib/copper/orders";
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
@@ -55,6 +55,9 @@ export type AskCopperRequest = {
 
 export type AskCopperResult = { progress: Live<Progress> };
 
+/** search_docs looks passages up, so Langfuse shows it as a retriever. */
+const RETRIEVERS = ["search_docs"];
+
 /** At most this many model steps (tool calls plus the reply) per agent. */
 const MAX_STEPS = 5;
 
@@ -72,12 +75,16 @@ const STOP = [
   hasToolCall("transfer_to_refund_agent", "transfer_to_copper"),
 ];
 
-
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
   if (agent === "support" && desk)
     return callStream(
-      { module: 5, feature: "support-agent", agent: AGENT_NAMES.support },
+      {
+        module: 5,
+        feature: "support-agent",
+        agent: AGENT_NAMES.support,
+        retrievers: RETRIEVERS,
+      },
       {
         messages,
         providerOptions: THOUGHT_SUMMARIES,
@@ -98,7 +105,12 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
       },
     );
   return callStream(
-    { module: 2, feature: "ask-copper", agent: AGENT_NAMES.copper },
+    {
+      module: 2,
+      feature: "ask-copper",
+      agent: AGENT_NAMES.copper,
+      retrievers: RETRIEVERS,
+    },
     {
       messages,
       providerOptions: THOUGHT_SUMMARIES,
@@ -264,8 +276,13 @@ export async function askCopper({
     {
       name: "ask-copper",
       sessionId,
+      // The Support page is Maya Reyes's account; the home page has no customer.
+      userId: desk ? CUSTOMER.toLowerCase().replace(/\s+/g, "-") : undefined,
       input: messages.at(-1)?.content,
-      tags: [variant === "single" ? "single-agent" : "multi-agent"],
+      tags: [
+        variant === "single" ? "single-agent" : "multi-agent",
+        desk ? "support-page" : "home-page",
+      ],
       metadata: { variant, page: desk ? "support" : "home" },
     },
     async (turn) => {

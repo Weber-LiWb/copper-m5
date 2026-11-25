@@ -44,6 +44,8 @@ export type CallInfo = {
   agent?: string;
   /** Set instead of `agent` when the call grades answers, like the eval judge. */
   evaluator?: string;
+  /** Tools that search documents, which Langfuse shows as retrievers. */
+  retrievers?: readonly string[];
 };
 
 // Omit that keeps generateText's "prompt or messages" union intact.
@@ -179,6 +181,7 @@ function traceFor(
     model,
     input: options.messages ?? options.prompt,
     metadata: { module: info.module, feature: info.feature, model },
+    retrievers: info.retrievers,
   });
 }
 

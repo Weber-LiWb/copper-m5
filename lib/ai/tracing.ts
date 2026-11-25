@@ -35,11 +35,65 @@ type Exporter = {
 // register a second one.
 const shared = globalThis as typeof globalThis & { __copperTracing?: Exporter };
 
+/**
+ * Keeps test and eval traffic out of production dashboards. Set
+ * LANGFUSE_TRACING_ENVIRONMENT to override.
+ */
+export function tracingEnvironment(): string {
+  const set = process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim();
+  if (set) return set;
+  if (process.env.CI) return "ci";
+  return process.env.NODE_ENV === "production" ? "production" : "development";
+}
+
+const EMAIL = /[\w.+-]+@[\w-]+(\.[\w-]+)+/g;
+// A number followed by "." still matches at the end of a sentence, but not
+// when the "." starts a decimal.
+const PHONE =
+  /(?<![\w.])(\+?1[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?!\w|\.\d)/g;
+const CARD = /(?<![\w.])\d(?:[ -]?\d){12,18}(?!\w|\.\d)/g;
+
+/** A card-shaped number that passes the Luhn check, so order ids and timestamps stay. */
+function isCardNumber(text: string): boolean {
+  const digits = text.replace(/\D/g, "");
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) {
+    let d = Number(digits[digits.length - 1 - i]);
+    if (i % 2 === 1) d = d * 2 > 9 ? d * 2 - 9 : d * 2;
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+/**
+ * Masks emails, phone numbers and card numbers anywhere in a traced value
+ * before it leaves the server. Customers type these into chats.
+ */
+export function maskPii(data: unknown): unknown {
+  if (typeof data === "string")
+    return data
+      .replace(EMAIL, "[email]")
+      .replace(CARD, (match) => (isCardNumber(match) ? "[card]" : match))
+      .replace(PHONE, "[phone]");
+  if (Array.isArray(data)) return data.map(maskPii);
+  if (data && typeof data === "object")
+    return Object.fromEntries(
+      Object.entries(data).map(([key, value]) => [key, maskPii(value)]),
+    );
+  return data;
+}
+
 /** Starts sending traces to Langfuse (once). False when the keys aren't set. */
 export function startTracing(): boolean {
   if (!isTracingConfigured()) return false;
   if (!shared.__copperTracing) {
-    const processor = new LangfuseSpanProcessor();
+    const processor = new LangfuseSpanProcessor({
+      environment: tracingEnvironment(),
+      release: (
+        process.env.GITHUB_SHA ?? process.env.VERCEL_GIT_COMMIT_SHA
+      )?.slice(0, 7),
+      mask: ({ data }) => maskPii(data),
+    });
     const provider = new NodeTracerProvider({ spanProcessors: [processor] });
     provider.register();
     shared.__copperTracing = { processor, provider };
@@ -99,6 +153,7 @@ export type Turn = {
 export type TurnInfo = {
   name: string;
   sessionId?: string;
+  userId?: string;
   input: unknown;
   tags?: string[];
   metadata?: Record<string, string>;
@@ -117,6 +172,7 @@ export async function traceTurn<T>(
         {
           traceName: info.name,
           sessionId: info.sessionId,
+          userId: info.userId,
           tags: info.tags,
           metadata: info.metadata,
         },
@@ -145,8 +201,9 @@ function generations(parent: LangfuseObservation, model: ModelId): Telemetry {
   let generation: LangfuseGeneration | undefined;
   return {
     onLanguageModelCallStart(event) {
+      // Named for the step, not the model: the model has its own field.
       generation = parent.startObservation(
-        event.modelId,
+        "llm-call",
         {
           model: event.modelId,
           input: { instructions: event.instructions, messages: event.messages },
@@ -176,10 +233,14 @@ function generations(parent: LangfuseObservation, model: ModelId): Telemetry {
   };
 }
 
-/** Each tool call becomes a tool observation inside the agent. */
+/**
+ * Each tool call becomes a tool observation inside the agent, or a retriever
+ * for tools that search documents.
+ */
 function traceTools<TOOLS extends ToolSet>(
   tools: TOOLS,
   parent: LangfuseObservation,
+  retrievers: readonly string[],
 ): TOOLS {
   return Object.fromEntries(
     Object.entries(tools).map(([name, tool]) => {
@@ -190,11 +251,9 @@ function traceTools<TOOLS extends ToolSet>(
         {
           ...tool,
           execute: async (input: unknown, options: unknown) => {
-            const span = parent.startObservation(
-              name,
-              { input },
-              { asType: "tool" },
-            );
+            const span = parent.startObservation(name, { input }, {
+              asType: retrievers.includes(name) ? "retriever" : "tool",
+            } as { asType: "tool" });
             try {
               const output = await current.run(span, () =>
                 (execute as (i: unknown, o: unknown) => unknown)(
@@ -240,6 +299,8 @@ export type CallTrace = {
   model: ModelId;
   input: unknown;
   metadata: Record<string, unknown>;
+  /** Tools that search documents, shown as retrievers. */
+  retrievers?: readonly string[];
 };
 
 /** Opens the observation for one call in lib/ai/call.ts. End it once. */
@@ -262,7 +323,8 @@ export function traceCall(call: CallTrace): CallSpan {
       functionId: call.name,
       integrations: generations(span, call.model),
     },
-    tools: (tools) => (tools ? traceTools(tools, span) : tools),
+    tools: (tools) =>
+      tools ? traceTools(tools, span, call.retrievers ?? []) : tools,
     end: (output, metadata) => close({ output, metadata }),
     fail: (error) =>
       close({ level: "ERROR", statusMessage: errorMessage(error) }),
@@ -282,7 +344,10 @@ export function traceEmbedding(info: {
     "embedding",
   );
   return {
-    end: () => span.end(),
+    end: () => {
+      span.update({ output: { embeddings: info.count } });
+      span.end();
+    },
     fail: (error) => {
       span.update({ level: "ERROR", statusMessage: errorMessage(error) });
       span.end();
