@@ -15,7 +15,7 @@ async function main() {
   const traceId = process.argv[2]?.trim();
   if (!traceId || !/^[0-9a-f]{32}$/.test(traceId))
     throw new Error("Usage: npm run share-trace -- <32-character trace id>");
-  if (!startTracing())
+  if (!startTracing({ global: true }))
     throw new Error("Set the three LANGFUSE_ variables in .env.local first.");
 
   const langfuse = new LangfuseClient();

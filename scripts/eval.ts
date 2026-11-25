@@ -129,7 +129,7 @@ async function main() {
       `Langfuse refused the keys (check LANGFUSE_BASE_URL's region): ${error instanceof Error ? error.message : error}`,
     );
   });
-  startTracing();
+  startTracing({ global: true });
   const dataset = await syncDataset(langfuse);
   const itemId = (c: GoldenCase) => `copper-golden-${c.id}`;
   const items = cases.flatMap(

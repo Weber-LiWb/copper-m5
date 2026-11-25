@@ -4,13 +4,14 @@
 // grouped by the chat's session. Without the three Langfuse keys, nothing is
 // traced and every helper just runs the code it wraps.
 import { AsyncLocalStorage } from "node:async_hooks";
+import { LangfuseOtelSpanAttributes } from "@langfuse/core";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import {
   type LangfuseGeneration,
   type LangfuseSpan,
   type LangfuseSpanAttributes,
   propagateAttributes,
-  startActiveObservation,
+  setLangfuseTracerProvider,
   startObservation,
 } from "@langfuse/tracing";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
@@ -83,8 +84,14 @@ export function maskPii(data: unknown): unknown {
   return data;
 }
 
-/** Starts sending traces to Langfuse (once). False when the keys aren't set. */
-export function startTracing(): boolean {
+/**
+ * Starts sending traces to Langfuse (once). False when the keys aren't set.
+ * The app keeps Langfuse's tracer to itself: registered globally, it also
+ * switches on Next.js's own fetch tracing, and with that on, Gemini's streamed
+ * replies were cut off mid-sentence. Scripts pass `global: true`, because
+ * Langfuse's experiment runner needs the global tracer and its async context.
+ */
+export function startTracing(options: { global?: boolean } = {}): boolean {
   if (!isTracingConfigured()) return false;
   if (!shared.__copperTracing) {
     const processor = new LangfuseSpanProcessor({
@@ -95,7 +102,8 @@ export function startTracing(): boolean {
       mask: ({ data }) => maskPii(data),
     });
     const provider = new NodeTracerProvider({ spanProcessors: [processor] });
-    provider.register();
+    if (options.global) provider.register();
+    else setLangfuseTracerProvider(provider);
     shared.__copperTracing = { processor, provider };
   }
   return true;
@@ -115,6 +123,9 @@ export async function stopTracing(): Promise<void> {
 /** What this file uses of a Langfuse span, agent, tool, chain or evaluator. */
 type LangfuseObservation = {
   traceId: string;
+  otelSpan: {
+    setAttributes(attributes: Record<string, string | string[]>): unknown;
+  };
   update(attributes: LangfuseSpanAttributes): unknown;
   end(): void;
   startObservation: LangfuseSpan["startObservation"];
@@ -127,7 +138,7 @@ const current = new AsyncLocalStorage<LangfuseObservation>();
 function child(
   name: string,
   attributes: LangfuseSpanAttributes,
-  asType: "agent" | "evaluator" | "embedding" | "span",
+  asType: "agent" | "chain" | "evaluator" | "embedding" | "span",
 ): LangfuseObservation {
   // The SDK has one overload per type, and only passes the type through.
   const options = { asType } as { asType: "span" };
@@ -165,29 +176,41 @@ export async function traceTurn<T>(
   run: (turn: Turn) => Promise<T>,
 ): Promise<T> {
   if (!startTracing()) return run({ update() {} });
-  return startActiveObservation(
+  const root = child(
     info.name,
-    (root) =>
-      propagateAttributes(
-        {
-          traceName: info.name,
-          sessionId: info.sessionId,
-          userId: info.userId,
-          tags: info.tags,
-          metadata: info.metadata,
-        },
-        () => {
-          root.update({ input: info.input, metadata: info.metadata });
-          return current.run(root, () =>
-            run({
-              update: (attributes) => root.update(attributes),
-              traceId: root.traceId,
-            }),
-          );
-        },
-      ),
-    { asType: "chain" },
+    { input: info.input, metadata: info.metadata },
+    "chain",
   );
+  // Set on the turn's own span, so they reach the trace even where no async
+  // context carries propagateAttributes (the app, see startTracing).
+  const { TRACE_NAME, TRACE_SESSION_ID, TRACE_USER_ID, TRACE_TAGS } =
+    LangfuseOtelSpanAttributes;
+  root.otelSpan.setAttributes({
+    [TRACE_NAME]: info.name,
+    ...(info.sessionId && { [TRACE_SESSION_ID]: info.sessionId }),
+    ...(info.userId && { [TRACE_USER_ID]: info.userId }),
+    ...(info.tags && { [TRACE_TAGS]: info.tags }),
+  });
+  try {
+    return await propagateAttributes(
+      {
+        traceName: info.name,
+        sessionId: info.sessionId,
+        userId: info.userId,
+        tags: info.tags,
+        metadata: info.metadata,
+      },
+      () =>
+        current.run(root, () =>
+          run({
+            update: (attributes) => root.update(attributes),
+            traceId: root.traceId,
+          }),
+        ),
+    );
+  } finally {
+    root.end();
+  }
 }
 
 export function usageDetails(usage: LanguageModelUsage) {

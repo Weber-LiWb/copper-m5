@@ -27,7 +27,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function main() {
   const langfuse = new LangfuseClient();
   await langfuse.api.projects.get();
-  startTracing();
+  startTracing({ global: true });
   try {
     await langfuse.api.datasets.get(DATASET);
   } catch {

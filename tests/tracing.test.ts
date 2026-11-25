@@ -17,6 +17,7 @@ type Node = {
   name: string;
   type: string;
   attributes: Record<string, unknown>[];
+  otel: Record<string, unknown>;
   children: Node[];
   ended: boolean;
 };
@@ -28,11 +29,17 @@ const langfuse = vi.hoisted(() => {
     name,
     type,
     attributes: attributes ? [attributes as Record<string, unknown>] : [],
+    otel: {},
     children: [],
     ended: false,
   });
   const observation = (n: Node): unknown => ({
     traceId: "trace-1",
+    otelSpan: {
+      setAttributes(attributes: Record<string, unknown>) {
+        Object.assign(n.otel, attributes);
+      },
+    },
     update(attributes: Record<string, unknown>) {
       n.attributes.push(attributes);
     },
@@ -53,6 +60,7 @@ const langfuse = vi.hoisted(() => {
     roots,
     propagated,
     flushed: { count: 0 },
+    registered: { global: 0, isolated: 0 },
     startObservation(
       name: string,
       attributes: unknown,
@@ -81,6 +89,9 @@ const langfuse = vi.hoisted(() => {
 vi.mock("@langfuse/tracing", () => ({
   startObservation: langfuse.startObservation,
   startActiveObservation: langfuse.startActiveObservation,
+  setLangfuseTracerProvider: () => {
+    langfuse.registered.isolated++;
+  },
   propagateAttributes: (
     params: Record<string, unknown>,
     run: () => unknown,
@@ -98,7 +109,9 @@ vi.mock("@langfuse/otel", () => ({
 }));
 vi.mock("@opentelemetry/sdk-trace-node", () => ({
   NodeTracerProvider: class {
-    register() {}
+    register() {
+      langfuse.registered.global++;
+    }
     async shutdown() {}
   },
 }));
@@ -257,6 +270,14 @@ describe("tracing with Langfuse keys", () => {
       userId: "maya-reyes",
       tags: ["multi-agent", "support-page"],
     });
+    // Set on the turn's span itself, so it reaches the trace without an
+    // async context (the app keeps Langfuse's tracer to itself).
+    expect(turn.otel).toEqual({
+      "langfuse.trace.name": "ask-copper",
+      "session.id": "chat-1",
+      "user.id": "maya-reyes",
+      "langfuse.trace.tags": ["multi-agent", "support-page"],
+    });
     expect(merged(turn)).toMatchObject({
       input: "Refund order 1002, please.",
       output: "Your $79 is refunded to your original payment.",
@@ -407,5 +428,25 @@ describe("what leaves the server", () => {
     expect(tracingEnvironment()).toBe("ci");
     vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "staging");
     expect(tracingEnvironment()).toBe("staging");
+  });
+});
+
+describe("registering the tracer", () => {
+  it("keeps the app's tracer to itself, and registers it globally only for scripts", async () => {
+    for (const [name, value] of Object.entries(LANGFUSE_ENV))
+      vi.stubEnv(name, value);
+    const shared = globalThis as { __copperTracing?: unknown };
+    const { startTracing } = await import("@/lib/ai/tracing");
+
+    delete shared.__copperTracing;
+    langfuse.registered.global = langfuse.registered.isolated = 0;
+    expect(startTracing()).toBe(true);
+    expect(langfuse.registered).toEqual({ global: 0, isolated: 1 });
+
+    delete shared.__copperTracing;
+    langfuse.registered.global = langfuse.registered.isolated = 0;
+    expect(startTracing({ global: true })).toBe(true);
+    expect(langfuse.registered).toEqual({ global: 1, isolated: 0 });
+    delete shared.__copperTracing;
   });
 });

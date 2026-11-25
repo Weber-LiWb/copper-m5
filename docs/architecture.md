@@ -207,7 +207,12 @@ code → the pull request's `eval` check.
 instead of `@langfuse/vercel-ai-sdk`, which pulls in a different `ai` version
 through `@ai-sdk/otel`; ours names each agent, nests tools under it and sets
 the cost from `pricing.ts`, so cost never shows 0 for a model Langfuse doesn't
-price. The eval is its own workflow on pull requests only: it spends live
+price. The app keeps Langfuse's tracer to itself (`setLangfuseTracerProvider`)
+instead of registering it globally: registered globally, it also switched on
+Next.js's own fetch tracing, and Gemini's streamed replies were cut off
+mid-sentence (2 of 2 turns; 0 of 1 with tracing off, 0 of 1 with the fix).
+The eval scripts register it globally, which Langfuse's experiment runner
+needs. The eval is its own workflow on pull requests only: it spends live
 Gemini calls, so it runs once per push on one OS rather than six times, and a
 push never reports a skipped `eval` that could satisfy branch protection.
 Gemini 3.5 Flash-Lite answered 503 "high demand" to a fifth to a third of
