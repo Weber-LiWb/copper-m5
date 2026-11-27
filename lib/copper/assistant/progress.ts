@@ -2,12 +2,16 @@
 // summaries, each tool call (with what went in and what came out), and the
 // reply. The panel draws this as it changes.
 
-/** Who is answering: Copper, or the Refund agent after a handoff (Module 4). */
-export type Agent = "copper" | "refund";
+/**
+ * Who is answering: Copper, or the Refund agent after a handoff (Module 4).
+ * Module 5's single-agent variant has one Support agent instead.
+ */
+export type Agent = "copper" | "refund" | "support";
 
 export const AGENT_NAMES: Record<Agent, string> = {
   copper: "Copper",
   refund: "Refund agent",
+  support: "Support agent",
 };
 
 export type ThinkingStep = { type: "thinking"; text: string; agent?: Agent };
@@ -36,6 +40,10 @@ export type Progress = {
   /** Who wrote the reply. Copper unless set. */
   agent?: Agent;
 };
+
+/** What Ask Copper says when the model fails or sends no reply. */
+export const FALLBACK_REPLY =
+  "Sorry, something went wrong on my end. Please try again.";
 
 /** Every tool call in an answer, in order. */
 export function toolCallsOf(progress: Progress) {
@@ -71,4 +79,13 @@ export const AGENT_TOOLS: Record<Agent, string[]> = {
     "search_docs",
   ],
   refund: ["get_orders", "request_refund", "transfer_to_copper"],
+  support: [
+    "get_products",
+    "get_prices",
+    "calculate_cost",
+    "check_availability",
+    "search_docs",
+    "get_orders",
+    "request_refund",
+  ],
 };

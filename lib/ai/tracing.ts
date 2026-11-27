@@ -1,0 +1,379 @@
+// Langfuse tracing (Module 5). lib/ai/call.ts traces every model call here:
+// each agent is an observation holding its model calls (generations, with
+// tokens and cost) and its tool calls. A chat turn wraps them in one trace,
+// grouped by the chat's session. Without the three Langfuse keys, nothing is
+// traced and every helper just runs the code it wraps.
+import { AsyncLocalStorage } from "node:async_hooks";
+import { LangfuseOtelSpanAttributes } from "@langfuse/core";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import {
+  type LangfuseGeneration,
+  type LangfuseSpan,
+  type LangfuseSpanAttributes,
+  propagateAttributes,
+  setLangfuseTracerProvider,
+  startObservation,
+} from "@langfuse/tracing";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import type { LanguageModelUsage, Telemetry, ToolSet } from "ai";
+import type { ModelId } from "@/lib/ai/models";
+import { costDetails } from "@/lib/ai/pricing";
+
+export function isTracingConfigured(): boolean {
+  return Boolean(
+    process.env.LANGFUSE_PUBLIC_KEY?.trim() &&
+    process.env.LANGFUSE_SECRET_KEY?.trim() &&
+    process.env.LANGFUSE_BASE_URL?.trim(),
+  );
+}
+
+type Exporter = {
+  processor: LangfuseSpanProcessor;
+  provider: NodeTracerProvider;
+};
+
+// One exporter per process, kept on globalThis so a dev-server reload doesn't
+// register a second one.
+const shared = globalThis as typeof globalThis & { __copperTracing?: Exporter };
+
+/**
+ * Keeps test and eval traffic out of production dashboards. Set
+ * LANGFUSE_TRACING_ENVIRONMENT to override.
+ */
+export function tracingEnvironment(): string {
+  const set = process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim();
+  if (set) return set;
+  if (process.env.CI) return "ci";
+  return process.env.NODE_ENV === "production" ? "production" : "development";
+}
+
+const EMAIL = /[\w.+-]+@[\w-]+(\.[\w-]+)+/g;
+// A number followed by "." still matches at the end of a sentence, but not
+// when the "." starts a decimal.
+const PHONE =
+  /(?<![\w.])(\+?1[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?!\w|\.\d)/g;
+const CARD = /(?<![\w.])\d(?:[ -]?\d){12,18}(?!\w|\.\d)/g;
+
+/** A card-shaped number that passes the Luhn check, so order ids and timestamps stay. */
+function isCardNumber(text: string): boolean {
+  const digits = text.replace(/\D/g, "");
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) {
+    let d = Number(digits[digits.length - 1 - i]);
+    if (i % 2 === 1) d = d * 2 > 9 ? d * 2 - 9 : d * 2;
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+/**
+ * Masks emails, phone numbers and card numbers anywhere in a traced value
+ * before it leaves the server. Customers type these into chats.
+ */
+export function maskPii(data: unknown): unknown {
+  if (typeof data === "string")
+    return data
+      .replace(EMAIL, "[email]")
+      .replace(CARD, (match) => (isCardNumber(match) ? "[card]" : match))
+      .replace(PHONE, "[phone]");
+  if (Array.isArray(data)) return data.map(maskPii);
+  if (data && typeof data === "object")
+    return Object.fromEntries(
+      Object.entries(data).map(([key, value]) => [key, maskPii(value)]),
+    );
+  return data;
+}
+
+/**
+ * Starts sending traces to Langfuse (once). False when the keys aren't set.
+ * The app keeps Langfuse's tracer to itself: registered globally, it also
+ * switches on Next.js's own fetch tracing, and with that on, Gemini's streamed
+ * replies were cut off mid-sentence. Scripts pass `global: true`, because
+ * Langfuse's experiment runner needs the global tracer and its async context.
+ */
+export function startTracing(options: { global?: boolean } = {}): boolean {
+  if (!isTracingConfigured()) return false;
+  if (!shared.__copperTracing) {
+    const processor = new LangfuseSpanProcessor({
+      environment: tracingEnvironment(),
+      release: (
+        process.env.GITHUB_SHA ?? process.env.VERCEL_GIT_COMMIT_SHA
+      )?.slice(0, 7),
+      mask: ({ data }) => maskPii(data),
+    });
+    const provider = new NodeTracerProvider({ spanProcessors: [processor] });
+    if (options.global) provider.register();
+    else setLangfuseTracerProvider(provider);
+    shared.__copperTracing = { processor, provider };
+  }
+  return true;
+}
+
+/** Sends any traces still waiting. Call when a turn or a script ends. */
+export async function flushTracing(): Promise<void> {
+  await shared.__copperTracing?.processor.forceFlush();
+}
+
+/** Sends what's left and stops the exporter, so a script can exit. */
+export async function stopTracing(): Promise<void> {
+  await shared.__copperTracing?.provider.shutdown();
+  delete shared.__copperTracing;
+}
+
+/** What this file uses of a Langfuse span, agent, tool, chain or evaluator. */
+type LangfuseObservation = {
+  traceId: string;
+  otelSpan: {
+    setAttributes(attributes: Record<string, string | string[]>): unknown;
+  };
+  update(attributes: LangfuseSpanAttributes): unknown;
+  end(): void;
+  startObservation: LangfuseSpan["startObservation"];
+};
+
+// The observation that new calls nest under: the turn, or the tool that is
+// running (search_docs embeds its query inside its own tool span).
+const current = new AsyncLocalStorage<LangfuseObservation>();
+
+function child(
+  name: string,
+  attributes: LangfuseSpanAttributes,
+  asType: "agent" | "chain" | "evaluator" | "embedding" | "span",
+): LangfuseObservation {
+  // The SDK has one overload per type, and only passes the type through.
+  const options = { asType } as { asType: "span" };
+  const parent = current.getStore();
+  return parent
+    ? parent.startObservation(name, attributes, options)
+    : startObservation(name, attributes, options);
+}
+
+export function errorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 500);
+}
+
+export type Turn = {
+  /** Records the reply and anything learned while answering. */
+  update(attributes: {
+    output?: unknown;
+    metadata?: Record<string, unknown>;
+  }): void;
+  traceId?: string;
+};
+
+export type TurnInfo = {
+  name: string;
+  sessionId?: string;
+  userId?: string;
+  input: unknown;
+  tags?: string[];
+  metadata?: Record<string, string>;
+};
+
+/** Runs one chat turn as one trace: every call inside nests under it. */
+export async function traceTurn<T>(
+  info: TurnInfo,
+  run: (turn: Turn) => Promise<T>,
+): Promise<T> {
+  if (!startTracing()) return run({ update() {} });
+  const root = child(
+    info.name,
+    { input: info.input, metadata: info.metadata },
+    "chain",
+  );
+  // Set on the turn's own span, so they reach the trace even where no async
+  // context carries propagateAttributes (the app, see startTracing).
+  const { TRACE_NAME, TRACE_SESSION_ID, TRACE_USER_ID, TRACE_TAGS } =
+    LangfuseOtelSpanAttributes;
+  root.otelSpan.setAttributes({
+    [TRACE_NAME]: info.name,
+    ...(info.sessionId && { [TRACE_SESSION_ID]: info.sessionId }),
+    ...(info.userId && { [TRACE_USER_ID]: info.userId }),
+    ...(info.tags && { [TRACE_TAGS]: info.tags }),
+  });
+  try {
+    return await propagateAttributes(
+      {
+        traceName: info.name,
+        sessionId: info.sessionId,
+        userId: info.userId,
+        tags: info.tags,
+        metadata: info.metadata,
+      },
+      () =>
+        current.run(root, () =>
+          run({
+            update: (attributes) => root.update(attributes),
+            traceId: root.traceId,
+          }),
+        ),
+    );
+  } finally {
+    root.end();
+  }
+}
+
+export function usageDetails(usage: LanguageModelUsage) {
+  const input = usage.inputTokens ?? 0;
+  const output = usage.outputTokens ?? 0;
+  return { input, output, total: input + output };
+}
+
+/** One generation per model request, with its tokens and cost (lib/ai/pricing.ts). */
+function generations(parent: LangfuseObservation, model: ModelId): Telemetry {
+  let generation: LangfuseGeneration | undefined;
+  return {
+    onLanguageModelCallStart(event) {
+      // Named for the step, not the model: the model has its own field.
+      generation = parent.startObservation(
+        "llm-call",
+        {
+          model: event.modelId,
+          input: { instructions: event.instructions, messages: event.messages },
+        },
+        { asType: "generation" },
+      );
+    },
+    onLanguageModelCallEnd(event) {
+      const usage = usageDetails(event.usage);
+      generation?.update({
+        output: event.content,
+        usageDetails: usage,
+        costDetails: costDetails(model, usage.input, usage.output),
+        metadata: { finishReason: event.finishReason },
+      });
+      generation?.end();
+      generation = undefined;
+    },
+    onError(event) {
+      generation?.update({
+        level: "ERROR",
+        statusMessage: errorMessage((event as { error?: unknown }).error),
+      });
+      generation?.end();
+      generation = undefined;
+    },
+  };
+}
+
+/**
+ * Each tool call becomes a tool observation inside the agent, or a retriever
+ * for tools that search documents.
+ */
+function traceTools<TOOLS extends ToolSet>(
+  tools: TOOLS,
+  parent: LangfuseObservation,
+  retrievers: readonly string[],
+): TOOLS {
+  return Object.fromEntries(
+    Object.entries(tools).map(([name, tool]) => {
+      const execute = tool.execute;
+      if (!execute) return [name, tool];
+      return [
+        name,
+        {
+          ...tool,
+          execute: async (input: unknown, options: unknown) => {
+            const span = parent.startObservation(name, { input }, {
+              asType: retrievers.includes(name) ? "retriever" : "tool",
+            } as { asType: "tool" });
+            try {
+              const output = await current.run(span, () =>
+                (execute as (i: unknown, o: unknown) => unknown)(
+                  input,
+                  options,
+                ),
+              );
+              span.update({ output });
+              return output;
+            } catch (error) {
+              span.update({
+                level: "ERROR",
+                statusMessage: errorMessage(error),
+              });
+              throw error;
+            } finally {
+              span.end();
+            }
+          },
+        },
+      ];
+    }),
+  ) as TOOLS;
+}
+
+export type CallSpan = {
+  telemetry?: { functionId: string; integrations: Telemetry };
+  tools<TOOLS extends ToolSet | undefined>(tools: TOOLS): TOOLS;
+  end(output?: unknown, metadata?: Record<string, unknown>): void;
+  fail(error: unknown): void;
+};
+
+const UNTRACED: CallSpan = {
+  tools: (tools) => tools,
+  end() {},
+  fail() {},
+};
+
+export type CallTrace = {
+  /** What Langfuse calls it: the agent's name, like "Copper", or the feature. */
+  name: string;
+  type: "agent" | "evaluator" | "span";
+  model: ModelId;
+  input: unknown;
+  metadata: Record<string, unknown>;
+  /** Tools that search documents, shown as retrievers. */
+  retrievers?: readonly string[];
+};
+
+/** Opens the observation for one call in lib/ai/call.ts. End it once. */
+export function traceCall(call: CallTrace): CallSpan {
+  if (!startTracing()) return UNTRACED;
+  const span = child(
+    call.name,
+    { input: call.input, metadata: call.metadata },
+    call.type,
+  );
+  let open = true;
+  const close = (attributes: Record<string, unknown>) => {
+    if (!open) return;
+    open = false;
+    span.update(attributes);
+    span.end();
+  };
+  return {
+    telemetry: {
+      functionId: call.name,
+      integrations: generations(span, call.model),
+    },
+    tools: (tools) =>
+      tools ? traceTools(tools, span, call.retrievers ?? []) : tools,
+    end: (output, metadata) => close({ output, metadata }),
+    fail: (error) =>
+      close({ level: "ERROR", statusMessage: errorMessage(error) }),
+  };
+}
+
+/** An embedding call (search_docs). Google reports no tokens, so no cost. */
+export function traceEmbedding(info: {
+  name: string;
+  model: string;
+  count: number;
+}): { end(): void; fail(error: unknown): void } {
+  if (!startTracing()) return UNTRACED;
+  const span = child(
+    info.name,
+    { input: { texts: info.count }, metadata: { model: info.model } },
+    "embedding",
+  );
+  return {
+    end: () => {
+      span.update({ output: { embeddings: info.count } });
+      span.end();
+    },
+    fail: (error) => {
+      span.update({ level: "ERROR", statusMessage: errorMessage(error) });
+      span.end();
+    },
+  };
+}

@@ -17,3 +17,15 @@ export function costUsd(
   const price = PRICING[model];
   return (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
 }
+
+/** The same cost split into input and output, as Langfuse records it (Module 5). */
+export function costDetails(
+  model: ModelId,
+  inputTokens: number,
+  outputTokens: number,
+) {
+  const price = PRICING[model];
+  const input = (inputTokens * price.input) / 1_000_000;
+  const output = (outputTokens * price.output) / 1_000_000;
+  return { input, output, total: input + output };
+}
